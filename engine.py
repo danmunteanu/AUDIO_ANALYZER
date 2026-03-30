@@ -274,7 +274,9 @@ def scan_files(folder, scan_subfolders, force_refresh, logger, db_path=DEFAULT_D
             bpm = get_bpm(y, sr)
             key, camelot = detect_key(y, sr)
 
-            logger(f"   ├─ BPM... {bpm:.2f} | Key... {key} | {camelot}")
+            logger(f"   ├─ BPM... {bpm:.2f}")
+            logger(f"   ├─ Key... {key} | {camelot}")
+            
             logger(f"   ├─ Duration... {format_duration(duration)}")
 
             q_score, q_label, q_details = analyze_quality(y, sr)
