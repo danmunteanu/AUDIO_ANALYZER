@@ -78,7 +78,7 @@ def detect_key(y, sr):
 
 
 # -----------------------------
-# QUALITY ANALYSIS (WITH NUMERIC DIAGNOSTICS)
+# QUALITY ANALYSIS
 # -----------------------------
 def analyze_quality(y, sr):
     stft = np.abs(librosa.stft(y))
@@ -95,9 +95,6 @@ def analyze_quality(y, sr):
     rolloff = np.mean(librosa.feature.spectral_rolloff(y=y, sr=sr, roll_percent=0.95))
     flatness = np.mean(librosa.feature.spectral_flatness(y=y))
 
-    # -------------------------
-    # SCORE
-    # -------------------------
     score = 0
     score += min(bandwidth / 20000, 1.0) * 40
     score += hf_energy * 30
@@ -113,41 +110,67 @@ def analyze_quality(y, sr):
     else:
         label = "Low"
 
-    # -------------------------
-    # DIAGNOSTIC REASONS (NUMERIC)
-    # -------------------------
     reasons = []
 
-    # Bandwidth diagnosis
     if bandwidth < 12000:
-        reasons.append(
-            f"Bandwidth is low ({bandwidth:.0f} Hz, expected ~16000–20000 Hz) → strong compression or low-pass filtering"
-        )
+        reasons.append(f"Bandwidth is low ({bandwidth:.0f} Hz, expected ~18000–20000 Hz)")
     elif bandwidth < 15000:
-        reasons.append(
-            f"Bandwidth is reduced ({bandwidth:.0f} Hz, expected ~18000–20000 Hz) → moderate compression"
-        )
+        reasons.append(f"Bandwidth is reduced ({bandwidth:.0f} Hz, expected ~18000–20000 Hz)")
 
-    # Rolloff diagnosis
     if rolloff < 12000:
-        reasons.append(
-            f"Spectral rolloff is low ({rolloff:.0f} Hz, expected ~15000–20000 Hz) → missing high-frequency energy"
-        )
+        reasons.append(f"Spectral rolloff is low ({rolloff:.0f} Hz, expected ~17000–20000 Hz)")
     elif rolloff < 15000:
-        reasons.append(
-            f"Spectral rolloff is reduced ({rolloff:.0f} Hz, expected ~17000–20000 Hz) → slightly dull audio"
-        )
+        reasons.append(f"Spectral rolloff is reduced ({rolloff:.0f} Hz, expected ~17000–20000 Hz)")
 
-    # Flatness check
     if flatness > 0.3:
-        reasons.append(
-            f"High spectral flatness ({flatness:.2f}) → possible encoding artifacts or smeared signal"
-        )
+        reasons.append(f"High spectral flatness ({flatness:.2f}) → possible artifacts")
 
     if not reasons:
         reasons.append("No major quality issues detected")
 
     return score, label, reasons
+
+
+# -----------------------------
+# FAKE 320kbps DETECTOR
+# -----------------------------
+def detect_fake_320(y, sr):
+    stft = np.abs(librosa.stft(y))
+    freqs = librosa.fft_frequencies(sr=sr)
+
+    power = np.mean(stft, axis=1)
+    power /= np.sum(power) + 1e-9
+
+    hf_energy = np.sum(power[freqs > 10000])
+
+    significant = power > np.max(power) * 0.01
+    bandwidth = np.max(freqs[significant]) if np.any(significant) else 0
+
+    rolloff = np.mean(
+        librosa.feature.spectral_rolloff(y=y, sr=sr, roll_percent=0.95)
+    )
+
+    suspicion = 0
+
+    if bandwidth < 14000:
+        suspicion += 0.5
+    if bandwidth < 12000:
+        suspicion += 0.3
+    if rolloff < 14000:
+        suspicion += 0.3
+    if hf_energy < 0.015:
+        suspicion += 0.3
+
+    suspicion = min(suspicion, 1.0)
+
+    if suspicion >= 0.7:
+        label = "VERY LIKELY FAKE 320kbps"
+    elif suspicion >= 0.4:
+        label = "SUSPICIOUS (possible transcode)"
+    else:
+        label = "LIKELY REAL HIGH QUALITY"
+
+    return suspicion, label, bandwidth, rolloff, hf_energy
 
 
 # -----------------------------
@@ -174,27 +197,32 @@ def analyze_file(file_path, index, total):
     print("   ├─ Loading audio...")
     y, sr = librosa.load(file_path, sr=None, mono=True)
 
-    # BPM
     print("   ├─ Detecting BPM...", end="", flush=True)
     bpm = get_bpm(y, sr)
     print(f" {bpm:.2f}")
 
-    # Key
     print("   ├─ Detecting key...", end="", flush=True)
     key, camelot = detect_key(y, sr)
     print(f" {key} | {camelot}")
 
-    # Duration
     duration_str = format_duration(duration)
     print(f"   ├─ Duration... {duration_str}")
 
-    # Quality
     print("   ├─ Analyzing quality...", end="", flush=True)
     quality_score, quality_label, reasons = analyze_quality(y, sr)
     print(f" {quality_label} ({quality_score:.1f}/100)")
 
     for r in reasons:
         print(f"   │  └─ {r}")
+
+    print("   ├─ Checking fake 320kbps...", end="", flush=True)
+    suspicion, fake_label, bw, ro, hf = detect_fake_320(y, sr)
+    print(f" {fake_label}")
+
+    if suspicion >= 0.4:
+        print(f"   │  └─ Bandwidth: {bw:.0f} Hz")
+        print(f"   │  └─ Rolloff: {ro:.0f} Hz")
+        print(f"   │  └─ HF energy: {hf:.4f}")
 
     elapsed = time.time() - start
 
@@ -212,7 +240,9 @@ def analyze_file(file_path, index, total):
         "camelot": camelot,
         "quality_score": quality_score,
         "quality_label": quality_label,
-        "reasons": reasons
+        "reasons": reasons,
+        "fake320_label": fake_label,
+        "fake320_suspicion": suspicion
     }
 
 
@@ -229,6 +259,7 @@ def write_stats(results, output_file="Stats.txt"):
             f.write(f"Key: {r['key']}\n")
             f.write(f"Camelot: {r['camelot']}\n")
             f.write(f"Quality: {r['quality_label']} ({r['quality_score']:.1f}/100)\n")
+            f.write(f"Fake 320kbps: {r['fake320_label']} ({r['fake320_suspicion']:.2f})\n")
 
             f.write("Diagnostics:\n")
             for reason in r["reasons"]:
@@ -268,7 +299,7 @@ def scan_folder():
 
 
 # -----------------------------
-# Main
+# MAIN
 # -----------------------------
 if __name__ == "__main__":
     scan_folder()
