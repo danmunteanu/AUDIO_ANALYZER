@@ -15,10 +15,19 @@ DEFAULT_DB = os.path.join(BASE_DIR, "audio_index.db")
 
 
 # =========================
+# PATH UTIL
+# =========================
+
+def normalize_path(p):
+    return os.path.normpath(os.path.abspath(p))
+
+
+# =========================
 # DATABASE
 # =========================
 
 def db_connect(db_path=DEFAULT_DB):
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
     return sqlite3.connect(db_path)
 
 
@@ -78,19 +87,18 @@ def db_upsert(conn, data):
     """, data)
 
 
-def mark_missing(conn, found):
+def mark_missing(conn):
     cur = conn.cursor()
     cur.execute("SELECT file_path FROM audio_files WHERE status='active'")
-    db_files = set(r[0] for r in cur.fetchall())
+    db_files = [r[0] for r in cur.fetchall()]
 
-    missing = db_files - found
-
-    for f in missing:
-        conn.execute("""
-        UPDATE audio_files
-        SET status='moved'
-        WHERE file_path=?
-        """, (f,))
+    for f in db_files:
+        if not os.path.exists(f):
+            conn.execute("""
+            UPDATE audio_files
+            SET status='moved'
+            WHERE file_path=?
+            """, (f,))
 
     conn.commit()
 
@@ -113,7 +121,7 @@ def get_duration(path):
 
 
 def format_duration(sec):
-    return f"{int(sec//60)}m{int(sec%60)}s"
+    return f"{int(sec // 60)}m{int(sec % 60)}s"
 
 
 # =========================
@@ -133,12 +141,13 @@ CAMELOT = {
 
 def get_bpm(y, sr):
     tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-    return float(tempo[0])
+    return float(tempo)
 
 
 def detect_key(y, sr):
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
     c = np.mean(chroma, axis=1)
+    c = np.nan_to_num(c)
 
     major = np.array([6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88])
     minor = np.array([6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17])
@@ -148,8 +157,8 @@ def detect_key(y, sr):
     best_mode = "major"
 
     for i in range(12):
-        m = np.corrcoef(c, np.roll(major, i))[0,1]
-        n = np.corrcoef(c, np.roll(minor, i))[0,1]
+        m = np.corrcoef(c, np.roll(major, i))[0, 1]
+        n = np.corrcoef(c, np.roll(minor, i))[0, 1]
 
         if m > best_score:
             best_score = m
@@ -203,8 +212,10 @@ def detect_fake_320(y, sr):
     bandwidth = np.max(freqs[power > np.max(power) * 0.01])
 
     score = 0
-    if bandwidth < 14000: score += 0.5
-    if bandwidth < 12000: score += 0.3
+    if bandwidth < 14000:
+        score += 0.5
+    if bandwidth < 12000:
+        score += 0.3
 
     label = "LIKELY REAL"
     if score >= 0.7:
@@ -223,8 +234,7 @@ def scan_files(folder, scan_subfolders, force_refresh, logger, db_path=DEFAULT_D
     conn = db_connect(db_path)
     db_init(conn)
 
-    existing = dict(db_load_all(conn))
-    found_files = set()
+    existing = {normalize_path(p): h for p, h in db_load_all(conn)}
 
     files = []
 
@@ -244,8 +254,7 @@ def scan_files(folder, scan_subfolders, force_refresh, logger, db_path=DEFAULT_D
 
     for i, path in enumerate(files, 1):
         try:
-            full = os.path.abspath(path)
-            found_files.add(full)
+            full = normalize_path(path)
 
             h = file_hash(path)
 
@@ -297,7 +306,7 @@ def scan_files(folder, scan_subfolders, force_refresh, logger, db_path=DEFAULT_D
         except Exception as e:
             logger(f"❌ Error: {e}")
 
-    mark_missing(conn, found_files)
+    mark_missing(conn)
 
     conn.commit()
     conn.close()
