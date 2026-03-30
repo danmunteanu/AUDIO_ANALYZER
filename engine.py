@@ -8,20 +8,18 @@ from mutagen import File
 
 
 # =========================
-# CONFIG
+# CONFIG DEFAULTS
 # =========================
-
-SCAN_SUBFOLDERS = False      # default OFF
-FORCE_REFRESH = False        # renamed as requested
-DB_NAME = "audio_index.db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DB = os.path.join(BASE_DIR, "audio_index.db")
 
 
 # =========================
 # DATABASE
 # =========================
 
-def db_connect():
-    return sqlite3.connect(DB_NAME)
+def db_connect(db_path=DEFAULT_DB):
+    return sqlite3.connect(db_path)
 
 
 def db_init(conn):
@@ -30,22 +28,16 @@ def db_init(conn):
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         file_path TEXT UNIQUE,
         file_name TEXT,
-
         duration REAL,
         bpm REAL,
-
         key_text TEXT,
         camelot_key TEXT,
-
         quality_score REAL,
         quality_label TEXT,
         quality_details TEXT,
-
         fake320_label TEXT,
         fake320_score REAL,
-
         file_hash TEXT,
-
         status TEXT,
         last_scanned TIMESTAMP
     )
@@ -55,7 +47,7 @@ def db_init(conn):
 
 def db_load_all(conn):
     cur = conn.cursor()
-    cur.execute("SELECT file_path, file_hash, status FROM audio_files")
+    cur.execute("SELECT file_path, file_hash FROM audio_files")
     return cur.fetchall()
 
 
@@ -84,15 +76,14 @@ def db_upsert(conn, data):
         status=excluded.status,
         last_scanned=excluded.last_scanned
     """, data)
-    conn.commit()
 
 
-def mark_missing_files(conn, found_files):
+def mark_missing(conn, found):
     cur = conn.cursor()
     cur.execute("SELECT file_path FROM audio_files WHERE status='active'")
     db_files = set(r[0] for r in cur.fetchall())
 
-    missing = db_files - found_files
+    missing = db_files - found
 
     for f in missing:
         conn.execute("""
@@ -105,7 +96,7 @@ def mark_missing_files(conn, found_files):
 
 
 # =========================
-# UTIL
+# FILE UTIL
 # =========================
 
 def file_hash(path):
@@ -116,13 +107,13 @@ def file_hash(path):
     return h.hexdigest()
 
 
-def format_duration(seconds):
-    return f"{int(seconds//60)}m{int(seconds%60)}s"
-
-
 def get_duration(path):
     audio = File(path)
     return audio.info.length if audio else 0
+
+
+def format_duration(sec):
+    return f"{int(sec//60)}m{int(sec%60)}s"
 
 
 # =========================
@@ -149,12 +140,12 @@ def detect_key(y, sr):
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
     c = np.mean(chroma, axis=1)
 
-    best_key = "C"
-    best_mode = "major"
-    best_score = -999
-
     major = np.array([6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88])
     minor = np.array([6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17])
+
+    best_score = -999
+    best_key = "C"
+    best_mode = "major"
 
     for i in range(12):
         m = np.corrcoef(c, np.roll(major, i))[0,1]
@@ -171,7 +162,7 @@ def detect_key(y, sr):
             best_mode = "minor"
 
     key_text = f"{best_key} {best_mode}"
-    camelot = CAMELOT.get(best_key + ("m" if best_mode=="minor" else ""), "Unknown")
+    camelot = CAMELOT.get(best_key + ("m" if best_mode == "minor" else ""), "Unknown")
 
     return key_text, camelot
 
@@ -183,23 +174,19 @@ def analyze_quality(y, sr):
     power = np.mean(stft, axis=1)
     power /= np.sum(power) + 1e-9
 
-    bandwidth = np.max(freqs[power > np.max(power)*0.01])
+    bandwidth = np.max(freqs[power > np.max(power) * 0.01])
     rolloff = np.mean(librosa.feature.spectral_rolloff(y=y, sr=sr))
 
-    score = 0
-    score += min(bandwidth/20000, 1)*50
-    score += min(rolloff/20000, 1)*50
+    score = (bandwidth + rolloff) / 400
     score = max(0, min(100, score))
 
-    label = "High" if score>70 else "Medium" if score>40 else "Low"
+    label = "High" if score > 70 else "Medium" if score > 40 else "Low"
 
     details = []
-
     if bandwidth < 12000:
         details.append(f"Low bandwidth ({int(bandwidth)} Hz)")
     if rolloff < 12000:
         details.append(f"Low spectral rolloff ({int(rolloff)} Hz)")
-
     if not details:
         details.append("No major issues detected")
 
@@ -211,9 +198,9 @@ def detect_fake_320(y, sr):
     freqs = librosa.fft_frequencies(sr=sr)
 
     power = np.mean(stft, axis=1)
-    power /= np.sum(power)+1e-9
+    power /= np.sum(power) + 1e-9
 
-    bandwidth = np.max(freqs[power > np.max(power)*0.01])
+    bandwidth = np.max(freqs[power > np.max(power) * 0.01])
 
     score = 0
     if bandwidth < 14000: score += 0.5
@@ -229,124 +216,90 @@ def detect_fake_320(y, sr):
 
 
 # =========================
-# FILE ANALYSIS
+# CORE SCAN FUNCTION
 # =========================
 
-def analyze_file(path, i, total):
-    print(f"\n[{i}/{total}] 🎵 {path}")
-
-    start = time.time()
-
-    duration = get_duration(path)
-    if duration > 600:
-        print("   ⏭️ Skipped (too long)")
-        return None
-
-    y, sr = librosa.load(path, sr=None, mono=True)
-
-    print("   ├─ Detecting BPM...", end="")
-    bpm = get_bpm(y, sr)
-    print(f" {bpm:.2f}")
-
-    print("   ├─ Detecting key...", end="")
-    key, camelot = detect_key(y, sr)
-    print(f" {key} | {camelot}")
-
-    print(f"   ├─ Duration... {format_duration(duration)}")
-
-    print("   ├─ Quality analysis...")
-    q_score, q_label, q_details = analyze_quality(y, sr)
-    print(f"   │  └─ {q_label} ({q_score:.1f})")
-
-    for d in q_details:
-        print(f"   │     └─ {d}")
-
-    print("   ├─ Fake 320 check...")
-    f_score, f_label = detect_fake_320(y, sr)
-    print(f"   │  └─ {f_label}")
-
-    elapsed = time.time() - start
-
-    return {
-        "path": path,
-        "file_name": os.path.basename(path),
-        "duration": duration,
-        "bpm": bpm,
-        "key": key,
-        "camelot": camelot,
-        "q_score": q_score,
-        "q_label": q_label,
-        "q_details": "\n".join(q_details),
-        "fake_label": f_label,
-        "fake_score": f_score,
-        "hash": file_hash(path),
-        "status": "active",
-        "time": time.time()
-    }
-
-
-# =========================
-# SCAN ENGINE
-# =========================
-
-def scan_files():
-    conn = db_connect()
+def scan_files(folder, scan_subfolders, force_refresh, logger, db_path=DEFAULT_DB):
+    conn = db_connect(db_path)
     db_init(conn)
 
-    existing = {r[0]: r[1] for r in db_load_all(conn)}
+    existing = dict(db_load_all(conn))
+    found_files = set()
 
     files = []
 
-    if SCAN_SUBFOLDERS:
-        for root, _, fs in os.walk("."):
+    if scan_subfolders:
+        for root, _, fs in os.walk(folder):
             for f in fs:
-                if f.endswith(".mp3"):
+                if f.lower().endswith(".mp3"):
                     files.append(os.path.join(root, f))
     else:
-        files = [f for f in os.listdir(".") if f.endswith(".mp3")]
+        files = [
+            os.path.join(folder, f)
+            for f in os.listdir(folder)
+            if f.lower().endswith(".mp3")
+        ]
 
-    found = set()
+    logger(f"📦 Found {len(files)} files\n")
 
-    print(f"\n📦 Found {len(files)} files\n")
+    for i, path in enumerate(files, 1):
+        try:
+            full = os.path.abspath(path)
+            found_files.add(full)
 
-    for i, f in enumerate(files, 1):
+            h = file_hash(path)
 
-        full = os.path.abspath(f)
-        found.add(full)
+            if not force_refresh and full in existing and existing[full] == h:
+                logger(f"[{i}] ⏭️ Skipped (no change)")
+                continue
 
-        h = file_hash(f)
+            logger(f"\n[{i}/{len(files)}] 🎵 {os.path.basename(path)}")
 
-        if not FORCE_REFRESH and full in existing and existing[full] == h:
-            print(f"[{i}] ⏭️ Skipped (no change)")
-            continue
+            duration = get_duration(path)
+            if duration > 600:
+                logger("   ⏭️ Skipped (too long)")
+                continue
 
-        res = analyze_file(f, i, len(files))
-        if res:
+            y, sr = librosa.load(path, sr=None, mono=True)
+
+            bpm = get_bpm(y, sr)
+            key, camelot = detect_key(y, sr)
+
+            logger(f"   ├─ BPM... {bpm:.2f} | Key... {key} | {camelot}")
+            logger(f"   ├─ Duration... {format_duration(duration)}")
+
+            q_score, q_label, q_details = analyze_quality(y, sr)
+            logger(f"   ├─ Quality... {q_label} ({q_score:.1f})")
+
+            for d in q_details:
+                logger(f"   │   └─ {d}")
+
+            f_score, f_label = detect_fake_320(y, sr)
+            logger(f"   ├─ Fake320... {f_label}")
+
             db_upsert(conn, (
                 full,
-                res["file_name"],
-                res["duration"],
-                res["bpm"],
-                res["key"],
-                res["camelot"],
-                res["q_score"],
-                res["q_label"],
-                res["q_details"],
-                res["fake_label"],
-                res["fake_score"],
-                res["hash"],
-                res["status"],
-                res["time"]
+                os.path.basename(path),
+                duration,
+                bpm,
+                key,
+                camelot,
+                q_score,
+                q_label,
+                "\n".join(q_details),
+                f_label,
+                f_score,
+                h,
+                "active",
+                time.time()
             ))
 
-    mark_missing_files(conn, found)
+        except Exception as e:
+            logger(f"❌ Error: {e}")
 
-    print("\n✅ Done")
+    mark_missing(conn, found_files)
 
+    conn.commit()
+    conn.close()
 
-# =========================
-# RUN
-# =========================
-
-if __name__ == "__main__":
-    scan_files()
+    logger("\n✅ Scan complete.")
