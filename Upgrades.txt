@@ -1,0 +1,6 @@
+progress bar per file
+cancel scan button
+live table updates in Tkinter
+duplicate detection (same song, different folder)
+“moved file recovery” (Serato-style)
+multiprocessing (even faster than threads)
