@@ -1,3 +1,6 @@
 from ui import root
 
-# UI already runs on import (tkinter mainloop in ui.py)
+if __name__ == "__main__":
+    # This is the ONLY place mainloop() should be called.
+    # It ensures the UI opens once, and workers stay silent.
+    root.mainloop()

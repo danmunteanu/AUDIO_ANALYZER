@@ -58,5 +58,3 @@ tk.Button(root, text="START SCAN", command=start_scan, bg="green", fg="white").p
 log_box = scrolledtext.ScrolledText(root, height=22)
 log_box.pack(fill="both", expand=True, padx=10, pady=10)
 
-
-root.mainloop()

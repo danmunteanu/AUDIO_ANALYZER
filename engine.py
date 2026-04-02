@@ -5,7 +5,7 @@ import hashlib
 import librosa
 import numpy as np
 from mutagen import File
-
+from concurrent.futures import ProcessPoolExecutor
 
 # =========================
 # CONFIG DEFAULTS
@@ -227,90 +227,99 @@ def detect_fake_320(y, sr):
 
 
 # =========================
+# PROCESS SINGLE FILE
+# =========================
+
+def process_single_file(path, force_refresh, existing_hash):
+    try:
+        full = normalize_path(path)
+        h = file_hash(path)
+
+        if not force_refresh and full in existing_hash and existing_hash[full] == h:
+            return "skipped", full, None
+
+        duration = get_duration(path)
+        if duration > 600:
+            return "too_long", full, None
+
+        y, sr = librosa.load(path, sr=None, mono=True)
+        bpm = get_bpm(y, sr)
+        key, camelot = detect_key(y, sr)
+        q_score, q_label, q_details = analyze_quality(y, sr)
+        f_score, f_label = detect_fake_320(y, sr)
+
+        data = (
+            full, os.path.basename(path), duration, bpm, key, camelot,
+            q_score, q_label, "\n".join(q_details), f_label, f_score, h,
+            "active", time.time()
+        )
+        return "success", full, data
+    except Exception as e:
+        return "error", path, str(e)
+        
+        
+
+# =========================
 # CORE SCAN FUNCTION
 # =========================
 
 def scan_files(folder, scan_subfolders, force_refresh, logger, db_path=DEFAULT_DB):
     conn = db_connect(db_path)
     db_init(conn)
-
     existing = {normalize_path(p): h for p, h in db_load_all(conn)}
+    
+    # ... (Keep your file discovery logic here) ...
+    files = [os.path.join(root, f) for root, _, fs in os.walk(folder) for f in fs if f.lower().endswith(".mp3")]
 
-    files = []
+    logger(f"📦 Found {len(files)} files. Starting parallel scan...")
 
-    if scan_subfolders:
-        for root, _, fs in os.walk(folder):
-            for f in fs:
-                if f.lower().endswith(".mp3"):
-                    files.append(os.path.join(root, f))
-    else:
-        files = [
-            os.path.join(folder, f)
-            for f in os.listdir(folder)
-            if f.lower().endswith(".mp3")
-        ]
-
-    logger(f"📦 Found {len(files)} files\n")
-
-    for i, path in enumerate(files, 1):
-        try:
-            full = normalize_path(path)
-
-            h = file_hash(path)
-
-            if not force_refresh and full in existing and existing[full] == h:
-                logger(f"[{i}] ⏭️ Skipped (no change)")
-                continue
-
-            logger(f"\n[{i}/{len(files)}] 🎵 {os.path.basename(path)}")
-
-            duration = get_duration(path)
-            if duration > 600:
-                logger("   ⏭️ Skipped (too long)")
-                continue
-
-            y, sr = librosa.load(path, sr=None, mono=True)
-
-            bpm = get_bpm(y, sr)
-            key, camelot = detect_key(y, sr)
-
-            logger(f"   ├─ BPM... {bpm:.2f}")
-            logger(f"   ├─ Key... {key} | {camelot}")
+    # The 'with' block ensures all 4 workers finish before moving to the next line
+    from concurrent.futures import ProcessPoolExecutor
+    with ProcessPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(process_single_file, f, force_refresh, existing) for f in files]
+        
+        for i, future in enumerate(futures, 1):
+            status, path, result = future.result()
+            fname = os.path.basename(path)
             
-            logger(f"   ├─ Duration... {format_duration(duration)}")
+            if status == "success":
+                db_upsert(conn, result)
+                
+                # Unpack result based on your process_single_file 'data' tuple
+                duration = result[2]
+                bpm      = result[3]
+                key      = result[4]
+                camelot  = result[5]
+                q_label  = result[7]
+                q_details = result[8]
+                f_label  = result[9]
+                f_score  = result[10]
 
-            q_score, q_label, q_details = analyze_quality(y, sr)
-            logger(f"   ├─ Quality... {q_label} ({q_score:.1f})")
+                # --- ORIGINAL DISPLAY LOGIC ---
+                logger(f"[{i}] ✅ {fname}")
+                logger(f"   ├─ BPM... {bpm:.2f} | Key... {key} | {camelot}")
+                logger(f"   ├─ BPM... {bpm:.2f}")
+                logger(f"   ├─ Key... {key} | {camelot}")
+                logger(f"   ├─ Duration... {format_duration(duration)}")
+                
+                # Quality details
+                logger(f"   ├─ Quality... {q_label}")
+                if q_details:
+                    for detail in q_details.split('\n'):
+                        logger(f"   │  └─ {detail}")
 
-            for d in q_details:
-                logger(f"   │   └─ {d}")
-
-            f_score, f_label = detect_fake_320(y, sr)
-            logger(f"   ├─ Fake320... {f_label}")
-
-            db_upsert(conn, (
-                full,
-                os.path.basename(path),
-                duration,
-                bpm,
-                key,
-                camelot,
-                q_score,
-                q_label,
-                "\n".join(q_details),
-                f_label,
-                f_score,
-                h,
-                "active",
-                time.time()
-            ))
-
-        except Exception as e:
-            logger(f"❌ Error: {e}")
+                # Fake 320 section
+                logger(f"   └─ Fake 320... {f_label} ({f_score:.2f})")
+                logger("") 
+            
+            elif status == "skipped":
+                logger(f"[{i}] ⏭️ {fname} (no change)\n")
+            elif status == "too_long":
+                logger(f"[{i}] ⏳ {fname} (Skipped: >10m)\n")
+            else:
+                logger(f"[{i}] ❌ Error {fname}: {result}\n")
 
     mark_missing(conn)
-
     conn.commit()
     conn.close()
-
     logger("\n✅ Scan complete.")
