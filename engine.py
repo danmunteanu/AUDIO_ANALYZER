@@ -268,7 +268,6 @@ def scan_files(folder, scan_subfolders, force_refresh, logger, db_path=DEFAULT_D
     db_init(conn)
     existing = {normalize_path(p): h for p, h in db_load_all(conn)}
     
-    # ... (Keep your file discovery logic here) ...
     files = [os.path.join(root, f) for root, _, fs in os.walk(folder) for f in fs if f.lower().endswith(".mp3")]
 
     logger(f"📦 Found {len(files)} files. Starting parallel scan...")
@@ -285,7 +284,7 @@ def scan_files(folder, scan_subfolders, force_refresh, logger, db_path=DEFAULT_D
             if status == "success":
                 db_upsert(conn, result)
                 
-                # Unpack result based on your process_single_file 'data' tuple
+                # Unpack result
                 duration = result[2]
                 bpm      = result[3]
                 key      = result[4]
@@ -295,7 +294,7 @@ def scan_files(folder, scan_subfolders, force_refresh, logger, db_path=DEFAULT_D
                 f_label  = result[9]
                 f_score  = result[10]
 
-                # --- ORIGINAL DISPLAY LOGIC ---
+                # Display
                 logger(f"[{i}] ✅ {fname}")
                 logger(f"   ├─ BPM... {bpm:.2f} | Key... {key} | {camelot}")
                 logger(f"   ├─ BPM... {bpm:.2f}")
